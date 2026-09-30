@@ -33,6 +33,7 @@
             installPhase = ''
               runHook preInstall
               install -Dm755 bridge.exe "$out/bin/bridge.exe"
+              install -Dm644 LICENSE "$out/share/licenses/rebocap-pipe-bridge/LICENSE"
               runHook postInstall
             '';
           };
