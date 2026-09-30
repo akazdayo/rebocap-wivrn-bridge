@@ -1,4 +1,5 @@
 mod protocol;
+mod solarxr;
 
 use openxr as xr;
 use protocol::{message_envelope::Body, DeviceStatus, Position, UniverseChange};
@@ -9,12 +10,36 @@ use std::{
     error::Error,
     io::{self, Write},
     net::{SocketAddr, TcpStream},
-    sync::mpsc::{self, Receiver},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver},
+    },
     thread,
     time::{Duration, Instant},
 };
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
+
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn interrupt(_: libc::c_int) {
+    INTERRUPTED.store(true, Ordering::Relaxed);
+}
+
+fn handle_signals() -> io::Result<()> {
+    // The handler only stores a lock-free atomic; cleanup happens on the main thread.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = interrupt as *const () as usize;
+        libc::sigemptyset(&mut action.sa_mask);
+        for signal in [libc::SIGINT, libc::SIGTERM] {
+            if libc::sigaction(signal, &action, std::ptr::null_mut()) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
+    Ok(())
+}
 
 #[derive(Serialize)]
 struct Pose {
@@ -66,6 +91,7 @@ struct Tracker {
 fn receive_trackers(
     rx: &Receiver<Option<Body>>,
     trackers: &mut HashMap<i32, Tracker>,
+    solarxr: Option<&solarxr::Server>,
 ) -> (bool, bool) {
     let mut received = false;
     loop {
@@ -77,6 +103,9 @@ fn receive_trackers(
             Err(mpsc::TryRecvError::Empty) => return (true, received),
             Err(mpsc::TryRecvError::Disconnected) => return (false, received),
         };
+        if let (Some(server), Some(body)) = (solarxr, &msg) {
+            server.receive(body);
+        }
         match msg {
             Some(Body::TrackerAdded(d)) => {
                 let t = trackers.entry(d.tracker_id).or_default();
@@ -172,7 +201,7 @@ fn configure_hands(
     Ok((set, spaces))
 }
 
-fn run(addr: SocketAddr) -> Result<()> {
+fn run(addr: SocketAddr, solarxr: Option<&solarxr::Server>) -> Result<()> {
     let entry = xr::Entry::linked();
     let available = entry.enumerate_extensions()?;
     if !available.mnd_headless || !available.khr_convert_timespec_time {
@@ -223,6 +252,9 @@ fn run(addr: SocketAddr) -> Result<()> {
     eprintln!("Waiting for WiVRn headset and Rebocap bridge at {addr}");
 
     loop {
+        if INTERRUPTED.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         while let Some(event) = instance.poll_event(&mut event_buffer)? {
             if let xr::Event::SessionStateChanged(e) = event {
                 if e.state() == xr::SessionState::READY && !started {
@@ -232,6 +264,9 @@ fn run(addr: SocketAddr) -> Result<()> {
                     session.end()?;
                     started = false;
                     last_status = None;
+                    if let Some(server) = solarxr {
+                        server.clear();
+                    }
                 } else if matches!(
                     e.state(),
                     xr::SessionState::EXITING | xr::SessionState::LOSS_PENDING
@@ -253,6 +288,9 @@ fn run(addr: SocketAddr) -> Result<()> {
                     bridge_wait_started = Instant::now();
                     bridge_wait_reported = false;
                     trackers.clear();
+                    if let Some(server) = solarxr {
+                        server.clear();
+                    }
                     eprintln!("TCP bridge connected; Wine named pipe not yet confirmed");
                 }
                 Err(e) if !connect_error_reported => {
@@ -286,7 +324,7 @@ fn run(addr: SocketAddr) -> Result<()> {
 
         if let Some((socket, rx)) = &mut connected {
             // A disconnected socket is detected by the read thread even if no writes are pending.
-            let (alive, received) = receive_trackers(rx, &mut trackers);
+            let (alive, received) = receive_trackers(rx, &mut trackers, solarxr);
             if received && !first_reply_seen {
                 eprintln!("Received a Rebocap protocol message via the Wine pipe");
                 first_reply_seen = true;
@@ -295,6 +333,9 @@ fn run(addr: SocketAddr) -> Result<()> {
                 connected = None;
                 connect_error_reported = false;
                 last_status = None;
+                if let Some(server) = solarxr {
+                    server.clear();
+                }
                 eprintln!("Rebocap bridge disconnected");
             } else {
                 let result = (|| -> io::Result<()> {
@@ -340,6 +381,9 @@ fn run(addr: SocketAddr) -> Result<()> {
                     connected = None;
                     connect_error_reported = false;
                     last_status = None;
+                    if let Some(server) = solarxr {
+                        server.clear();
+                    }
                 } else if !first_reply_seen
                     && !bridge_wait_reported
                     && bridge_wait_started.elapsed() >= Duration::from_secs(5)
@@ -391,27 +435,141 @@ fn run(addr: SocketAddr) -> Result<()> {
     }
 }
 
-fn main() {
-    let mut args = env::args().skip(1);
-    let addr = match (args.next(), args.next()) {
-        (None, None) => "127.0.0.1:36850".parse().unwrap(),
-        (Some(flag), Some(value)) if flag == "--bridge" => match value.parse() {
-            Ok(addr) => addr,
-            Err(e) => {
-                eprintln!("Invalid --bridge address: {e}");
-                std::process::exit(2);
+const USAGE: &str = "Usage: monad2steamvr [--bridge IP:PORT] [--solarxr]
+  --solarxr                  Publish Rebocap FBT to WiVRn via SolarXR IPC
+  --tracker-roles 0,5,6       Rebocap roles to register (default: waist and feet)
+  --solarxr-offset X,Y,Z      Output translation in metres (default: 0,0,0)
+  --solarxr-yaw DEGREES       Output yaw about +Y (default: 0)
+Start with --solarxr BEFORE connecting the WiVRn headset. Requires XDG_RUNTIME_DIR.
+HMD/controller and Rebocap poses are also emitted as NDJSON.";
+
+struct Options {
+    addr: SocketAddr,
+    solarxr: bool,
+    roles: Vec<i32>,
+    offset: [f32; 3],
+    yaw: f64,
+}
+
+fn options(args: impl Iterator<Item = String>) -> Result<Option<Options>> {
+    let mut args = args;
+    let mut opts = Options {
+        addr: "127.0.0.1:36850".parse()?,
+        solarxr: false,
+        roles: vec![0, 5, 6],
+        offset: [0.0; 3],
+        yaw: 0.0,
+    };
+    let mut output_options = false;
+    while let Some(flag) = args.next() {
+        if flag == "--help" || flag == "-h" {
+            return Ok(None);
+        }
+        if flag == "--solarxr" {
+            opts.solarxr = true;
+            continue;
+        }
+        if !matches!(
+            flag.as_str(),
+            "--bridge" | "--tracker-roles" | "--solarxr-offset" | "--solarxr-yaw"
+        ) {
+            return Err(format!("Unknown option: {flag}").into());
+        }
+        let value = args
+            .next()
+            .ok_or_else(|| format!("Missing value for {flag}"))?;
+        match flag.as_str() {
+            "--bridge" => opts.addr = value.parse()?,
+            "--tracker-roles" => {
+                opts.roles = solarxr::parse_roles(&value)?;
+                output_options = true;
             }
-        },
-        (Some(flag), None) if flag == "--help" || flag == "-h" => {
-            println!("Usage: monad2steamvr [--bridge IP:PORT]\nWiVRn headset/controller poses -> stdout NDJSON; Rebocap VR handshake/tracker poses via bridge.exe");
+            "--solarxr-offset" => {
+                let values: Vec<f32> = value
+                    .split(',')
+                    .map(str::parse)
+                    .collect::<std::result::Result<_, _>>()?;
+                opts.offset = values
+                    .try_into()
+                    .map_err(|_| "--solarxr-offset needs X,Y,Z")?;
+                if !opts.offset.iter().all(|x| x.is_finite()) {
+                    return Err("offset must be finite".into());
+                }
+                output_options = true;
+            }
+            "--solarxr-yaw" => {
+                let degrees: f64 = value.parse()?;
+                if !degrees.is_finite() {
+                    return Err("yaw must be finite".into());
+                }
+                opts.yaw = degrees.rem_euclid(360.0).to_radians();
+                output_options = true;
+            }
+            _ => unreachable!(),
+        }
+    }
+    if output_options && !opts.solarxr {
+        return Err("SolarXR options require --solarxr".into());
+    }
+    Ok(Some(opts))
+}
+
+fn main() {
+    let opts = match options(env::args().skip(1)) {
+        Ok(Some(opts)) => opts,
+        Ok(None) => {
+            println!("{USAGE}");
             return;
         }
-        _ => {
-            eprintln!("Usage: monad2steamvr [--bridge IP:PORT]");
+        Err(e) => {
+            eprintln!("{e}\n{USAGE}");
             std::process::exit(2);
         }
     };
-    if let Err(e) = run(addr) {
+    let result = (|| -> Result<()> {
+        handle_signals()?;
+        // Binding and enumeration must work before OpenXR waits for a headset.
+        let server = opts
+            .solarxr
+            .then(|| solarxr::Server::start(opts.roles, opts.offset, opts.yaw))
+            .transpose()?;
+        let mut waiting_reported = false;
+        loop {
+            if INTERRUPTED.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            match run(opts.addr, server.as_ref()) {
+                Ok(()) if server.is_none() || INTERRUPTED.load(Ordering::Relaxed) => return Ok(()),
+                Ok(()) => {}
+                Err(e) => {
+                    let retry = server.is_some()
+                        && e.downcast_ref::<xr::sys::Result>().is_some_and(|e| {
+                            matches!(
+                                *e,
+                                xr::sys::Result::ERROR_RUNTIME_UNAVAILABLE
+                                    | xr::sys::Result::ERROR_RUNTIME_FAILURE
+                                    | xr::sys::Result::ERROR_INITIALIZATION_FAILED
+                                    | xr::sys::Result::ERROR_FORM_FACTOR_UNAVAILABLE
+                                    | xr::sys::Result::ERROR_INSTANCE_LOST
+                                    | xr::sys::Result::ERROR_SESSION_LOST
+                            )
+                        });
+                    if !retry {
+                        return Err(e);
+                    }
+                    if !waiting_reported {
+                        eprintln!("WiVRn session unavailable: {e}; SolarXR remains ready while waiting for the headset");
+                        waiting_reported = true;
+                    }
+                }
+            }
+            if let Some(server) = &server {
+                server.clear();
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+    })();
+    if let Err(e) = result {
         eprintln!("monad2steamvr: {e}");
         std::process::exit(1);
     }

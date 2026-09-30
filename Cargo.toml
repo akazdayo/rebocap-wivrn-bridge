@@ -2,9 +2,10 @@
 name = "monad2steamvr"
 version = "0.1.0"
 edition = "2021"
-description = "WiVRn OpenXR head pose to Rebocap VR-mode bridge"
+description = "WiVRn/Rebocap VR-mode bridge with SolarXR full-body tracker output"
 
 [dependencies]
+libc = "0.2"
 openxr = { version = "0.21.1", features = ["linked"] }
 prost = "0.14"
 serde = { version = "1", features = ["derive"] }
